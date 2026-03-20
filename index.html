@@ -6,7 +6,7 @@
   <title>GSL Cooler Box Tracker</title>
   <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     :root{
@@ -52,17 +52,24 @@
     .nav-btn{flex:1;min-width:60px;background:none;border:none;border-bottom:3px solid transparent;color:var(--muted);font-family:var(--font);font-size:12px;font-weight:700;padding:10px 6px 9px;cursor:pointer;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap}
     .nav-btn.active{color:var(--orange);border-bottom-color:var(--orange)}
     /* SCANNER */
-    #scanner-wrap{display:none;margin-bottom:12px;border-radius:10px;overflow:hidden;position:relative;background:#000}
+    #scanner-wrap{display:none;margin-bottom:12px;border-radius:10px;overflow:hidden;background:#000}
     #scanner-wrap.active{display:block}
-    #zxing-container video{width:100%!important;height:auto!important;display:block}
-    .scan-reticle{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:60%;aspect-ratio:2/1;pointer-events:none;z-index:10}
-    .scan-reticle::before,.scan-reticle::after{content:'';position:absolute;width:22px;height:22px;border-color:var(--orange);border-style:solid}
-    .scan-reticle::before{top:0;left:0;border-width:3px 0 0 3px}
-    .scan-reticle::after{bottom:0;right:0;border-width:0 3px 3px 0}
-    .scan-reticle .tr{position:absolute;top:0;right:0;width:22px;height:22px;border:3px solid var(--orange);border-left:none;border-bottom:none}
-    .scan-reticle .bl{position:absolute;bottom:0;left:0;width:22px;height:22px;border:3px solid var(--orange);border-right:none;border-top:none}
-    .scan-line{position:absolute;left:5%;right:5%;height:2px;background:linear-gradient(90deg,transparent,var(--orange),transparent);animation:scanline 1.8s ease-in-out infinite;z-index:11}
-    @keyframes scanline{0%{top:15%;opacity:0}10%{opacity:1}90%{opacity:1}100%{top:85%;opacity:0}}
+    #qr-reader{width:100%}
+    #qr-reader video{border-radius:10px}
+    /* Override Html5-Qrcode default styles to match our dark theme */
+    #qr-reader__scan_region{background:#000}
+    #qr-reader__dashboard{background:var(--surface2)!important;border:none!important;padding:8px!important}
+    #qr-reader__dashboard_section_csr button{
+      background:var(--orange)!important;color:#000!important;
+      border:none!important;border-radius:6px!important;
+      font-weight:700!important;padding:8px 16px!important;cursor:pointer!important
+    }
+    #qr-reader__status_span{color:var(--muted)!important;font-size:12px!important}
+    #qr-reader__camera_selection{
+      background:var(--surface2)!important;color:var(--text)!important;
+      border:1px solid var(--border)!important;border-radius:6px!important;
+      padding:6px!important;width:100%!important;margin-bottom:6px!important
+    }
     .scan-status{background:rgba(0,0,0,0.8);color:var(--orange);font-size:12px;text-align:center;padding:7px;font-weight:600;letter-spacing:0.04em}
     .scan-btn{background:var(--blue);color:#fff;border:none;font-family:var(--font);font-size:13px;font-weight:700;padding:11px;border-radius:8px;cursor:pointer;width:100%;margin-bottom:10px}
     .scan-btn.stop{background:var(--red-dim);border:1px solid var(--red);color:var(--red)}
@@ -235,10 +242,7 @@
     <div class="card">
       <div class="card-title">Scan or Enter Box ID</div>
       <div id="scanner-wrap">
-        <div id="zxing-container">
-          <div class="scan-reticle"><div class="tr"></div><div class="bl"></div><div class="scan-line"></div></div>
-        </div>
-        <div class="scan-status" id="scan-status">&#128269; Point camera at QR code or barcode</div>
+        <div id="qr-reader"></div>
       </div>
       <button class="scan-btn" id="scan-toggle-btn" onclick="toggleScanner()">&#128247; Start Scanner</button>
       <label>Box ID</label>
@@ -342,7 +346,7 @@ var db            = null;
 var currentAction = "OUT";
 var boxQueue      = [];
 var scannerOn     = false;
-var codeReader    = null;
+var html5QrCode   = null;
 var allBoxesOut   = [];
 var adminUnlocked = false;
 var confirmCb     = null;
@@ -504,47 +508,63 @@ function getDriver(){
 }
 
 // ════════════════════════════════════════════════════════════
-// SCANNER (ZXing — works on GitHub Pages, not Apps Script)
+// SCANNER — Html5-Qrcode (most reliable on mobile)
 // ════════════════════════════════════════════════════════════
 function toggleScanner(){ scannerOn ? stopScanner() : startScanner(); }
 
 function startScanner(){
-  if(typeof ZXing === "undefined"){
-    showToast("Scanner library not loaded — use manual entry","error"); return;
+  if(typeof Html5Qrcode === "undefined"){
+    showToast("Scanner not loaded — use manual entry","error"); return;
   }
-  if(codeReader){ try{ codeReader.reset(); }catch(e){} }
-  codeReader = new ZXing.BrowserMultiFormatReader();
 
-  ZXing.BrowserMultiFormatReader.listVideoInputDevices().then(function(devices){
-    var back = devices.find(function(d){ return d.label && d.label.toLowerCase().includes("back"); });
-    var devId = back ? back.deviceId : (devices.length > 0 ? devices[devices.length-1].deviceId : null);
-    var constraints = devId ? {video:{deviceId:{exact:devId}}} : {video:{facingMode:"environment"}};
+  // Stop any existing instance first
+  stopScanner();
 
-    codeReader.decodeFromConstraints(constraints, "zxing-container", function(result, err){
-      if(result){
-        var val = result.getText().trim().toUpperCase();
-        document.getElementById("box-input").value = val;
-        document.getElementById("scan-status").textContent = "Scanned: " + val;
-        stopScanner();
-        addBoxToQueue();
-      }
-      if(err && !(err instanceof ZXing.NotFoundException)) console.warn(err);
-    }).then(function(){
-      scannerOn = true;
-      document.getElementById("scanner-wrap").classList.add("active");
-      document.getElementById("scan-toggle-btn").textContent = "Stop Scanner";
-      document.getElementById("scan-toggle-btn").className   = "scan-btn stop";
-    }).catch(function(err){
-      var msg = err.name === "NotAllowedError"
-        ? "Camera permission denied. Tap the lock icon in your address bar and allow camera access."
-        : "Camera error: " + err.message;
-      showToast(msg, "error", 6000);
-    });
-  }).catch(function(err){ showToast("Cannot access camera: " + err.message, "error"); });
+  html5QrCode = new Html5Qrcode("qr-reader");
+
+  var config = {
+    fps: 10,
+    qrbox: { width: 250, height: 150 },
+    aspectRatio: 1.5,
+    supportedScanTypes: [Html5QrcodeScanType.SCAN_TYPE_CAMERA]
+  };
+
+  html5QrCode.start(
+    { facingMode: "environment" },
+    config,
+    function(decodedText){
+      // Successful scan
+      var val = decodedText.trim().toUpperCase();
+      document.getElementById("box-input").value = val;
+      stopScanner();
+      addBoxToQueue();
+      showToast("Scanned: " + val, "info");
+    },
+    function(){ /* scan attempt — fires constantly, ignore */ }
+  ).then(function(){
+    scannerOn = true;
+    document.getElementById("scanner-wrap").classList.add("active");
+    document.getElementById("scan-toggle-btn").textContent = "Stop Scanner";
+    document.getElementById("scan-toggle-btn").className   = "scan-btn stop";
+  }).catch(function(err){
+    var errStr = String(err || "");
+    var msg = errStr.toLowerCase().includes("notallowed") || errStr.toLowerCase().includes("permission")
+      ? "Camera permission denied. Tap the lock icon in the address bar and allow camera, then refresh."
+      : "Camera error: " + errStr;
+    showToast(msg, "error", 8000);
+    document.getElementById("scanner-wrap").classList.remove("active");
+  });
 }
 
 function stopScanner(){
-  if(codeReader){ try{ codeReader.reset(); }catch(e){} }
+  if(html5QrCode){
+    try{
+      html5QrCode.stop().then(function(){
+        try{ html5QrCode.clear(); }catch(e){}
+        html5QrCode = null;
+      }).catch(function(){ html5QrCode = null; });
+    }catch(e){ html5QrCode = null; }
+  }
   scannerOn = false;
   document.getElementById("scanner-wrap").classList.remove("active");
   document.getElementById("scan-toggle-btn").textContent = "Start Scanner";
