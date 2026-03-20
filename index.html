@@ -236,7 +236,7 @@
     <div class="card">
       <div class="card-title">Scan or Enter Box ID</div>
       <div id="scanner-wrap">
-        <video id="qr-video" playsinline muted autoplay></video>
+        <video id="qr-video" playsinline muted autoplay style="width:100%;display:block;border-radius:10px;background:#000"></video>
         <canvas id="qr-canvas"></canvas>
         <div class="scan-overlay">
           <div class="scan-box"><div class="scan-line"></div></div>
@@ -392,6 +392,7 @@ function showTab(name, btn){
   });
   document.querySelectorAll(".nav-btn").forEach(function(b){ b.classList.remove("active"); });
   if(btn) btn.classList.add("active");
+  if(name === "scan")    loadDriverDropdown(); // always refresh drivers on scan tab
   if(name === "out")     loadOut();
   if(name === "history") refreshHistDrivers();
   if(name === "admin")   { if(adminUnlocked) loadAdminData(); }
@@ -541,17 +542,31 @@ function startScanner(){
     videoStream = stream;
     var video = document.getElementById("qr-video");
     video.srcObject = stream;
-    video.play();
+    video.setAttribute("playsinline", true);
+    video.setAttribute("muted", true);
+    video.muted = true;
 
-    scannerOn = true;
-    document.getElementById("scanner-wrap").classList.add("active");
-    document.getElementById("scan-toggle-btn").textContent = "Stop Scanner";
-    document.getElementById("scan-toggle-btn").className   = "scan-btn stop";
-
-    // Wait for video to be ready then start loop
-    video.addEventListener("loadeddata", function(){
-      scanLoop = setInterval(scanFrame, 200); // scan 5 times per second
-    }, {once:true});
+    // Force play and wait for it to actually start
+    var playPromise = video.play();
+    if(playPromise !== undefined){
+      playPromise.then(function(){
+        scannerOn = true;
+        document.getElementById("scanner-wrap").classList.add("active");
+        document.getElementById("scan-toggle-btn").textContent = "Stop Scanner";
+        document.getElementById("scan-toggle-btn").className   = "scan-btn stop";
+        // Start scan loop after video is confirmed playing
+        scanLoop = setInterval(scanFrame, 250);
+      }).catch(function(err){
+        showToast("Video play error: " + err.message, "error");
+      });
+    } else {
+      // Older browser — just start
+      scannerOn = true;
+      document.getElementById("scanner-wrap").classList.add("active");
+      document.getElementById("scan-toggle-btn").textContent = "Stop Scanner";
+      document.getElementById("scan-toggle-btn").className   = "scan-btn stop";
+      scanLoop = setInterval(scanFrame, 250);
+    }
 
   }).catch(function(err){
     var msg = (err.name === "NotAllowedError" || err.name === "PermissionDeniedError")
