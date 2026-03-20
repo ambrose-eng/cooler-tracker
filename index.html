@@ -6,7 +6,8 @@
   <title>GSL Cooler Box Tracker</title>
   <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
-  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <!-- No external scanner library — using native BarcodeDetector API + jsQR fallback -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     :root{
@@ -52,26 +53,19 @@
     .nav-btn{flex:1;min-width:60px;background:none;border:none;border-bottom:3px solid transparent;color:var(--muted);font-family:var(--font);font-size:12px;font-weight:700;padding:10px 6px 9px;cursor:pointer;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap}
     .nav-btn.active{color:var(--orange);border-bottom-color:var(--orange)}
     /* SCANNER */
-    #scanner-wrap{display:none;margin-bottom:12px;border-radius:10px;overflow:hidden;background:#000}
+    #scanner-wrap{display:none;margin-bottom:12px;border-radius:10px;overflow:hidden;position:relative;background:#000}
     #scanner-wrap.active{display:block}
-    #qr-reader{width:100%}
-    #qr-reader video{border-radius:10px}
-    /* Override Html5-Qrcode default styles to match our dark theme */
-    #qr-reader__scan_region{background:#000}
-    #qr-reader__dashboard{background:var(--surface2)!important;border:none!important;padding:8px!important}
-    #qr-reader__dashboard_section_csr button{
-      background:var(--orange)!important;color:#000!important;
-      border:none!important;border-radius:6px!important;
-      font-weight:700!important;padding:8px 16px!important;cursor:pointer!important
-    }
-    #qr-reader__status_span{color:var(--muted)!important;font-size:12px!important}
-    #qr-reader__camera_selection{
-      background:var(--surface2)!important;color:var(--text)!important;
-      border:1px solid var(--border)!important;border-radius:6px!important;
-      padding:6px!important;width:100%!important;margin-bottom:6px!important
-    }
-    .scan-status{background:rgba(0,0,0,0.8);color:var(--orange);font-size:12px;text-align:center;padding:7px;font-weight:600;letter-spacing:0.04em}
-    .scan-btn{background:var(--blue);color:#fff;border:none;font-family:var(--font);font-size:13px;font-weight:700;padding:11px;border-radius:8px;cursor:pointer;width:100%;margin-bottom:10px}
+    #qr-video{width:100%;display:block;border-radius:10px}
+    #qr-canvas{display:none}
+    .scan-overlay{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0}
+    .scan-box{width:65%;aspect-ratio:1.8;border:3px solid var(--orange);border-radius:8px;box-shadow:0 0 0 9999px rgba(0,0,0,0.45);position:relative}
+    .scan-box::before,.scan-box::after{content:'';position:absolute;width:16px;height:16px;border-color:var(--orange);border-style:solid}
+    .scan-box::before{top:-3px;left:-3px;border-width:4px 0 0 4px}
+    .scan-box::after{bottom:-3px;right:-3px;border-width:0 4px 4px 0}
+    .scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--orange),transparent);animation:scanmove 1.5s ease-in-out infinite}
+    @keyframes scanmove{0%,100%{top:10%}50%{top:85%}}
+    .scan-hint{position:absolute;bottom:10px;left:0;right:0;text-align:center;color:rgba(255,255,255,0.8);font-size:12px;font-weight:600;letter-spacing:0.04em;text-shadow:0 1px 3px rgba(0,0,0,0.8)}
+    .scan-btn{background:var(--blue);color:#fff;border:none;font-family:var(--font);font-size:14px;font-weight:700;padding:12px;border-radius:8px;cursor:pointer;width:100%;margin-bottom:10px;-webkit-tap-highlight-color:transparent}
     .scan-btn.stop{background:var(--red-dim);border:1px solid var(--red);color:var(--red)}
     /* BOX QUEUE */
     .queue-label{font-size:11px;color:var(--muted);margin-bottom:5px}
@@ -242,7 +236,12 @@
     <div class="card">
       <div class="card-title">Scan or Enter Box ID</div>
       <div id="scanner-wrap">
-        <div id="qr-reader"></div>
+        <video id="qr-video" playsinline muted autoplay></video>
+        <canvas id="qr-canvas"></canvas>
+        <div class="scan-overlay">
+          <div class="scan-box"><div class="scan-line"></div></div>
+          <div class="scan-hint">Point at QR code</div>
+        </div>
       </div>
       <button class="scan-btn" id="scan-toggle-btn" onclick="toggleScanner()">&#128247; Start Scanner</button>
       <label>Box ID</label>
@@ -346,7 +345,6 @@ var db            = null;
 var currentAction = "OUT";
 var boxQueue      = [];
 var scannerOn     = false;
-var html5QrCode   = null;
 var allBoxesOut   = [];
 var adminUnlocked = false;
 var confirmCb     = null;
@@ -508,68 +506,141 @@ function getDriver(){
 }
 
 // ════════════════════════════════════════════════════════════
-// SCANNER — Html5-Qrcode (most reliable on mobile)
+// SCANNER — Native camera + jsQR (no third-party library)
+// Works on any modern mobile browser over HTTPS
 // ════════════════════════════════════════════════════════════
+var videoStream   = null;
+var scanLoop      = null;
+var lastScanned   = "";
+var lastScannedAt = 0;
+var barcodeDetector = null;
+
+// Use native BarcodeDetector if available (Chrome on Android)
+// Fall back to jsQR for all other browsers
+function initDetector(){
+  if("BarcodeDetector" in window){
+    try{
+      barcodeDetector = new BarcodeDetector({formats:["qr_code","code_128","code_39","ean_13","upc_a"]});
+      console.log("Using native BarcodeDetector");
+    }catch(e){ barcodeDetector = null; }
+  }
+}
+
 function toggleScanner(){ scannerOn ? stopScanner() : startScanner(); }
 
 function startScanner(){
-  if(typeof Html5Qrcode === "undefined"){
-    showToast("Scanner not loaded — use manual entry","error"); return;
+  initDetector();
+
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showToast("Camera not supported on this browser","error"); return;
   }
 
-  // Stop any existing instance first
-  stopScanner();
+  navigator.mediaDevices.getUserMedia({
+    video:{ facingMode:"environment", width:{ideal:1280}, height:{ideal:720} }
+  }).then(function(stream){
+    videoStream = stream;
+    var video = document.getElementById("qr-video");
+    video.srcObject = stream;
+    video.play();
 
-  html5QrCode = new Html5Qrcode("qr-reader");
-
-  var config = {
-    fps: 10,
-    qrbox: { width: 250, height: 150 },
-    aspectRatio: 1.5,
-    supportedScanTypes: [Html5QrcodeScanType.SCAN_TYPE_CAMERA]
-  };
-
-  html5QrCode.start(
-    { facingMode: "environment" },
-    config,
-    function(decodedText){
-      // Successful scan
-      var val = decodedText.trim().toUpperCase();
-      document.getElementById("box-input").value = val;
-      stopScanner();
-      addBoxToQueue();
-      showToast("Scanned: " + val, "info");
-    },
-    function(){ /* scan attempt — fires constantly, ignore */ }
-  ).then(function(){
     scannerOn = true;
     document.getElementById("scanner-wrap").classList.add("active");
     document.getElementById("scan-toggle-btn").textContent = "Stop Scanner";
     document.getElementById("scan-toggle-btn").className   = "scan-btn stop";
+
+    // Wait for video to be ready then start loop
+    video.addEventListener("loadeddata", function(){
+      scanLoop = setInterval(scanFrame, 200); // scan 5 times per second
+    }, {once:true});
+
   }).catch(function(err){
-    var errStr = String(err || "");
-    var msg = errStr.toLowerCase().includes("notallowed") || errStr.toLowerCase().includes("permission")
-      ? "Camera permission denied. Tap the lock icon in the address bar and allow camera, then refresh."
-      : "Camera error: " + errStr;
+    var msg = (err.name === "NotAllowedError" || err.name === "PermissionDeniedError")
+      ? "Camera permission denied.\n\nTap the lock icon in your address bar → Permissions → Camera → Allow, then try again."
+      : "Cannot open camera: " + err.message;
     showToast(msg, "error", 8000);
-    document.getElementById("scanner-wrap").classList.remove("active");
   });
 }
 
-function stopScanner(){
-  if(html5QrCode){
-    try{
-      html5QrCode.stop().then(function(){
-        try{ html5QrCode.clear(); }catch(e){}
-        html5QrCode = null;
-      }).catch(function(){ html5QrCode = null; });
-    }catch(e){ html5QrCode = null; }
+function scanFrame(){
+  var video = document.getElementById("qr-video");
+  if(!video || video.readyState < 2 || video.paused) return;
+
+  var canvas = document.getElementById("qr-canvas");
+  var w = video.videoWidth;
+  var h = video.videoHeight;
+  if(!w || !h) return;
+
+  canvas.width  = w;
+  canvas.height = h;
+  var ctx = canvas.getContext("2d");
+  ctx.drawImage(video, 0, 0, w, h);
+
+  // Try native BarcodeDetector first (faster, better on Android)
+  if(barcodeDetector){
+    barcodeDetector.detect(canvas).then(function(barcodes){
+      if(barcodes && barcodes.length > 0){
+        handleScan(barcodes[0].rawValue);
+      }
+    }).catch(function(){
+      // Fall back to jsQR on error
+      tryJsQR(ctx, w, h);
+    });
+  } else {
+    tryJsQR(ctx, w, h);
   }
+}
+
+function tryJsQR(ctx, w, h){
+  if(typeof jsQR === "undefined") return;
+  try{
+    var imageData = ctx.getImageData(0, 0, w, h);
+    var code = jsQR(imageData.data, imageData.width, imageData.height, {
+      inversionAttempts:"dontInvert"
+    });
+    if(code && code.data){ handleScan(code.data); }
+  }catch(e){}
+}
+
+function handleScan(raw){
+  if(!raw) return;
+  var val = raw.trim().toUpperCase();
+  if(!val) return;
+
+  // Debounce — ignore same value within 2.5 seconds
+  var now = Date.now();
+  if(val === lastScanned && (now - lastScannedAt) < 2500) return;
+  lastScanned   = val;
+  lastScannedAt = now;
+
+  // Vibrate on success if supported
+  if(navigator.vibrate) navigator.vibrate(100);
+
+  document.getElementById("box-input").value = val;
+  addBoxToQueue();
+  showToast("Scanned: " + val, "info", 1500);
+  // Keep scanner running for next box
+}
+
+function stopScanner(){
+  clearInterval(scanLoop);
+  scanLoop = null;
+
+  if(videoStream){
+    videoStream.getTracks().forEach(function(t){ t.stop(); });
+    videoStream = null;
+  }
+
+  var video = document.getElementById("qr-video");
+  if(video){ video.srcObject = null; }
+
   scannerOn = false;
   document.getElementById("scanner-wrap").classList.remove("active");
   document.getElementById("scan-toggle-btn").textContent = "Start Scanner";
   document.getElementById("scan-toggle-btn").className   = "scan-btn";
 }
+
+// Stop scanner when leaving scan tab — handled by showTab above
+
 
 // ════════════════════════════════════════════════════════════
 // ACTION
